@@ -1,0 +1,756 @@
+#!/bin/sh
+
+# set -ex
+cc=$(which cc)
+cxx=$(which c++)
+
+CFLAGS=$CFLAGS
+LDFLAGS=$LDFLAGS
+
+AVX2FLAGS=$AVX2FLAGS
+AVX2_SRCS=$AVX2_SRCS
+ARCH_SRCS=$ARCH_SRCS
+
+
+extra_cflags=$extra_cflags
+
+debug=y
+shared=y
+static=n
+enable_cpu_ext=y
+lib_static_suffix=a
+lib_shared_suffix=so
+cmd=
+# SFLAGS=-O
+# LDFLAGS=
+# LDSHARED=$(CC)
+# CPP=$(CC) -E
+
+AR=ar
+ARFLAGS=rc
+RANLIB=ranlib
+# LDCONFIG=ldconfig
+# LDSHAREDLIBC=-lc
+# TAR=tar
+# SHELL=/bin/sh
+# EXE=
+
+logfile=./config.log
+config_mk_file=./config.mak
+
+rm -rf $logfile
+
+log(){
+    echo "$@" | tee -a $logfile
+}
+
+AWSTMPDIR=$(mktemp -d) || exit 1
+tmpfile(){
+    tmp="${AWSTMPDIR}/test"$2
+    (set -C; exec > $tmp) 2> /dev/null || { echo "mktemp failed"; exit 1; }
+    eval $1=$tmp
+}
+
+trap 'rm -rf -- "$AWSTMPDIR"' EXIT
+trap 'exit 2' INT
+
+
+init(){
+    target_os_default=$(tolower $(uname -s))
+    target_os=$target_os_default
+    host_os=$target_os_default
+    cpu="generic"
+
+    case "$(uname -m)" in
+        i?86) cpu=intel;arch="32" ;;
+        x86_64) cpu=intel;arch="64" ;;
+        arm*) cpu="arm"; arch="32";;
+        aarch64*) cpu="arm"; arch="64";;
+        *) arch="unkown" ;;
+    esac
+}
+
+# Avoid locale weirdness, besides we really just want to translate ASCII.
+toupper(){
+    echo "$@" | tr abcdefghijklmnopqrstuvwxyz ABCDEFGHIJKLMNOPQRSTUVWXYZ
+}
+
+tolower(){
+    echo "$@" | tr ABCDEFGHIJKLMNOPQRSTUVWXYZ abcdefghijklmnopqrstuvwxyz
+}
+
+c_escape(){
+    echo "$*" | sed 's/["\\]/\\\0/g'
+}
+
+#### ------------------------------- process c flags ---------------------------
+tmpfile TMPASM .asm
+tmpfile TMPC   .c
+tmpfile TMPCPP .cpp
+tmpfile TMPE   $EXESUF
+tmpfile TMPH   .h
+tmpfile TMPM   .m
+tmpfile TMPO   .o
+tmpfile TMPI   .i
+tmpfile TMPS   .S
+tmpfile TMPSH  .sh
+tmpfile TMPV   .ver
+
+AS_C='-c'
+AS_O='-o $@'
+CC_C='-c'
+CC_E='-E -o $@'
+CC_O='-o $@'
+CXX_C='-c'
+CXX_O='-o $@'
+OBJCC_C='-c'
+OBJCC_E='-E -o $@'
+OBJCC_O='-o $@'
+X86ASM_O='-o $@'
+LD_O='-o $@'
+LD_LIB='-l%'
+LD_PATH='-L'
+HOSTCC_C='-c'
+HOSTCC_E='-E -o $@'
+HOSTCC_O='-o $@'
+HOSTLD_O='-o $@'
+NVCC_C='-c'
+NVCC_O='-o $@'
+
+
+if test -t 1 && which tput >/dev/null 2>&1; then
+    ncolors=$(tput colors)
+    if test -n "$ncolors" && test $ncolors -ge 8; then
+        bold_color=$(tput bold)
+        warn_color=$(tput setaf 3)
+        error_color=$(tput setaf 1)
+        reset_color=$(tput sgr0)
+    fi
+    # 72 used instead of 80 since that's the default of pr
+    ncols=$(tput cols)
+fi
+: ${ncols:=72}
+
+
+exesuf() {
+    case $1 in
+        mingw32*|mingw64*|msys*|win32|win64|cygwin*|*-dos|freedos|opendos|os/2*|symbian) echo .exe ;;
+    esac
+}
+
+EXESUF=$(exesuf $target_os)
+HOSTEXESUF=$(exesuf $host_os)
+
+die(){
+    log "$@"
+    echo "$error_color$bold_color$@$reset_color"
+    cat <<EOF
+If you think configure made a mistake, make sure you are using the latest
+version from Git.  If the latest version fails, report the problem to the
+ffmpeg-user@ffmpeg.org mailing list or IRC #ffmpeg on irc.libera.chat.
+EOF
+    if disabled logging; then
+        cat <<EOF
+Rerun configure with logging enabled (do not use --disable-logging), and
+include the log this produces with your report.
+EOF
+    else
+        cat <<EOF
+Include the log file "$logfile" produced by configure as this will help
+solve the problem.
+EOF
+    fi
+    exit 1
+}
+
+set_all(){
+    value=$1
+    shift
+    for var in $*; do
+        eval $var=$value
+    done
+}
+
+enable(){
+    set_all y $*
+}
+
+enabled(){
+    test "${1#!}" = "$1" && op='=' || op=!=
+    eval test "x\$${1#!}" $op "xy"
+}
+disabled(){
+    test "${1#!}" = "$1" && op='=' || op=!=
+    eval test "x\$${1#!}" $op "xn"
+}
+
+disable(){
+    set_all n $*
+}
+
+append(){
+    var=$1
+    shift
+    eval "$var=\"\$$var $*\""
+}
+
+check_cppflags(){
+    log check_cppflags "$@"
+    check_cpp "$@" <<EOF && append CPPFLAGS "$@"
+#include <stdlib.h>
+EOF
+}
+
+cflags_filter=echo
+asflags_filter=echo
+cflags_filter=echo
+ldflags_filter=echo
+
+test_cflags(){
+    log test_cflags "$@"
+    set -- $($cflags_filter "$@")
+    check_cc "$@" <<EOF
+int x;
+EOF
+}
+
+check_cflags(){
+    log check_cflags "$@"
+    test_cflags "$@" && add_cflags "$@"
+}
+
+add_cflags(){
+    append CFLAGS $($cflags_filter "$@")
+}
+add_cppflags(){
+    append CPPFLAGS "$@"
+}
+
+add_ldflags(){
+    append LDFLAGS $($ldflags_filter "$@")
+}
+
+add_cxxflags(){
+    append CXXFLAGS $($cflags_filter "$@")
+}
+
+add_asflags(){
+    append ASFLAGS $($asflags_filter "$@")
+}
+
+log_file(){
+    log BEGIN $1
+    pr -n -t $1 >> $logfile
+    log END $1
+}
+
+check_inline_asm_flags(){
+    log check_inline_asm_flags "$@"
+    name="$1"
+    code="$2"
+    flags=''
+    shift 2
+    while [ "$1" != "" ]; do
+      append flags $1
+      shift
+    done;
+    disable $name
+    cat > $TMPC <<EOF
+void foo(void){ __asm__ volatile($code); }
+EOF
+    log_file $TMPC
+    check_cmd $cc $CPPFLAGS $CFLAGS $flags "$@" $CC_C $(cc_o $TMPO) $TMPC &&
+    enable $name && add_cflags $flags && add_asflags $flags && add_ldflags $flags
+}
+
+print_include(){
+    hdr=$1
+    test "${hdr%.h}" = "${hdr}" &&
+        echo "#include $hdr"    ||
+        echo "#include <$hdr>"
+}
+
+test_code(){
+    log test_code "$@"
+    check=$1
+    headers=$2
+    code=$3
+    shift 3
+    {
+        for hdr in $headers; do
+            print_include $hdr
+        done
+        echo "int main(void) { $code; return 0; }"
+    } | check_$check "$@"
+}
+
+check_cmd(){
+    log "$@"
+    "$@" >> $logfile 2>&1
+}
+
+cc_o(){
+    eval printf '%s\\n' $CC_O
+}
+
+cc_e(){
+    eval printf '%s\\n' $CC_E
+}
+
+
+check_cc(){
+    log check_cc "$@"
+    cat > $TMPC
+    log_file $TMPC
+    check_cmd $cc $CPPFLAGS $CFLAGS "$@" $CC_C $(cc_o $TMPO) $TMPC
+}
+
+
+check_cxx(){
+    log check_cxx "$@"
+    cat > $TMPCPP
+    log_file $TMPCPP
+    check_cmd $cxx $CPPFLAGS $CFLAGS $CXXFLAGS "$@" $CXX_C -o $TMPO $TMPCPP
+}
+
+test_cflags_cc(){
+    log test_cflags_cc "$@"
+    flags=$1
+    headers=$2
+    code=$3
+    shift 1
+    set -- $($cflags_filter "$flags")
+    {
+        for hdr in $headers; do
+            print_include $hdr
+        done
+        echo "int main(void) { $code; return 0; }"
+    }| check_cc "$@"
+}
+
+
+
+###### process cflags
+
+process_cflags(){
+    add_cflags "-Wall -Wstrict-prototypes"
+    enabled warn_as_error && add_cflags "-Werror"
+
+    add_cflags "-Wextra -pedantic -Wno-long-long"
+
+    ### lagency supports
+    add_cflags "-Wno-strict-aliasing"
+
+    test_cflags_cc "-fPIC -Werror" ""  "" && add_cflags -fPIC
+
+
+    if [ $cpu = "arm" ] && [ "$arch" = "64" ]; then
+        test_cflags_cc "-moutline-atomics -Werror" "" "int x = 1; __atomic_fetch_add(&x, -1, __ATOMIC_SEQ_CST);" && add_cflags -moutline-atomics
+    fi
+
+
+    if [ "$arch" = "64" ]; then
+        add_cflags -D_FILE_OFFSET_BITS=64
+    fi
+
+
+    test_code cc "stdint.h" "" || add_cflags -DNO_STDINT
+    test_code cc "stdbool.h" "" || add_cflags -DNO_STDBOOL
+
+    test_cflags "-Wgnu -Werror" && add_cflags '-Wgnu -Wno-gnu-zero-variadic-macro-arguments'
+
+
+    # hu
+    # test_cflags_cc "-Wgnu -Werror" "netinet/in.h" "uint32_t x = 0; x = htonl(x);" || add_cflags -Wno-gnu-statement-expression
+
+    ## private define
+    test_code cc "unistd.h" "sysconf(_SC_NPROCESSORS_ONLN);" && add_cflags -DHAVE_SYSCONF
+
+    enabled debug && add_cflags "-DDEBUG -DDEBUG_BUILD -g -O0"
+    enabled release && add_cflags "-DNDBG -DNDEBUG -g -O2 -fno-omit-frame-pointer"
+
+    ## release LTO disabled by default
+
+    ## should work with shared library only. Need to check with static library
+    # disabled static && add_cflags -fvisibility=hidden
+
+    if cc -v 2>&1 | grep -q gcc ; then
+        add_cflags -std=gnu99
+    else
+        add_cflags -std=c99
+    fi
+
+    if [  "$host_os" = "linux" ]; then
+        add_cflags '-D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=500'
+    fi
+}
+
+
+###        AVX2 settings
+
+add_avxflags(){
+    append AVX2FLAGS $(echo "$@")
+}
+
+intel_avx(){
+    test_cflags_cc "-mavx2" "" "" && enable AVX2_flags
+
+    enabled AVX2_flags && {
+        test_cflags_cc "-mavx -mavx2" "immintrin.h emmintrin.h string.h" "__m256i vec;memset(&vec, 0, sizeof(vec));_mm256_shuffle_epi8(vec, vec);_mm256_set_epi32(1,2,3,4,5,6,7,8);_mm256_permutevar8x32_epi32(vec, vec);" && add_avxflags '-DHAVE_AVX2_INTRINSICS -DUSE_SIMD_ENCODING'
+
+        test_cflags_cc "-mavx -mavx2" "immintrin.h string.h" "__m256i vec; memset(&vec, 0, sizeof(vec)); return (int)_mm256_extract_epi64(vec, 2);" && add_avxflags -DHAVE_MM256_EXTRACT_EPI64
+
+        add_avxflags "-mavx -mavx2"
+    }
+
+    append AVX2_SRCS "./source/arch/intel/encoding_avx2.c"
+    add_cflags $AVX2FLAGS
+}
+
+add_arch_srcs(){
+    append ARCH_SRCS $(echo "$@")
+}
+
+process_arch(){
+    disabled enable_cpu_ext && {
+        return
+    }
+    if [ "$cpu" = "intel" ]; then
+       if [ "$host_os" = "linux" ]; then
+            ARCH_SRCS=
+            for file_ in ./source/arch/intel/asm/*.c; do
+                add_arch_srcs $file_
+            done
+            add_arch_srcs ./source/arch/intel/cpuid.c
+        fi 
+    fi
+
+    if [ "$cpu" = "arm" ]; then
+        test_code "sys/auxv.h" "#ifdef __linux__ getauxval(AT_HWCAP); getauxval(AT_HWCAP2);#endif" && {
+            ARCH_SRCS=
+            for file_ in ./source/arch/arm/asm/*.c; do
+                add_arch_srcs $file_
+            done
+        }
+    fi
+    if [ "$cpu" = "generic" ]; then
+        ARCH_SRCS=
+        for file_ in ./source/arch/generic/*.c; do
+            add_arch_srcs $file_
+        done
+    fi
+
+}
+
+### Thread settings
+
+test_code_thread() {
+    log test_code_thread "$@"
+    check=$1
+    code=$3
+    shift 3
+    flags='-D_GNU_SOURCE -Werror=implicit-function-declaration'
+    cat > $TMPC << EOF
+        #include <pthread.h>
+
+        #if defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__)
+        #include <pthread_np.h>
+        #endif
+
+        int main() {
+            pthread_t thread_id;
+            $code; 
+            return 0;
+        }
+EOF
+    log_file $TMPC
+    check_cmd $cc $CPPFLAGS $CFLAGS "$@" $flags $CC_C $(cc_o $TMPO) $TMPC
+}
+
+process_thread_set_name(){
+    test_code_thread cc "" "pthread_setname_np(thread_id, \"asdf\");" && enable AWS_PTHREAD_SETNAME_TAKES_2ARGS
+    enabled AWS_PTHREAD_SETNAME_TAKES_2ARGS && {
+        add_cflags -DAWS_PTHREAD_SETNAME_TAKES_2ARGS
+        return
+    }
+    test_code_thread cc "" "pthread_set_name_np(thread_id, \"asdf\");" && enable AWS_PTHREAD_SET_NAME_TAKES_2ARGS
+    enabled AWS_PTHREAD_SET_NAME_TAKES_2ARGS && {
+        add_cflags -DAWS_PTHREAD_SET_NAME_TAKES_2ARGS
+        return
+    }
+    test_code_thread cc "" "pthread_setname_np(thread_id, \"asdf\", NULL);" && enable AWS_PTHREAD_SETNAME_TAKES_3ARGS
+    enabled AWS_PTHREAD_SETNAME_TAKES_3ARGS && {
+        add_cflags -DAWS_PTHREAD_SETNAME_TAKES_3ARGS
+        return
+    }
+}
+
+process_thread_get_name(){
+
+    if [ "$host_os" = "apple" ]; then
+        add_cflags -DAWS_PTHREAD_GETNAME_TAKES_3ARGS
+        return
+    fi
+    if [ "$host_os" = "win32" ]; then
+        return
+    fi
+    test_code_thread cc "" "char name[16] = {0}; pthread_getname_np(thread_id, name);" && enable AWS_PTHREAD_GET_NAME_TAKES_2ARGS
+
+    enabled AWS_PTHREAD_GET_NAME_TAKES_2ARGS && {
+        add_cflags -DAWS_PTHREAD_GETNAME_TAKES_2ARGS
+        return
+    }
+
+    test_code_thread cc "" "char name[16] = {0}; pthread_get_name_np(thread_id, name);" && enable AWS_PTHREAD_GET_NAME_TAKES_2ARGS
+    enabled AWS_PTHREAD_GET_NAME_TAKES_2ARGS && {
+        add_cflags -DAWS_PTHREAD_GET_NAME_TAKES_2ARGS
+        return
+    }
+    test_code_thread cc "" "char name[16] = {0}; pthread_getname_np(thread_id, name, 16);" && enable AWS_PTHREAD_GETNAME_TAKES_3ARGS
+    enabled AWS_PTHREAD_GETNAME_TAKES_3ARGS && {
+        add_cflags -DAWS_PTHREAD_GETNAME_TAKES_3ARGS
+    }
+}
+
+### thread affanity
+
+check_pthread_affinity() {
+    
+    log check_pthread_affinity Begin
+
+    check_symbol "pthread.h" "pthread_attr_setaffinity_np" "" "-D_GNU_SOURCE -Werror=implicit-function-declaration" && {
+        add_cflags -DAWS_AFFINITY_METHOD=AWS_AFFINITY_METHOD_PTHREAD_ATTR
+        return
+    }
+
+    check_symbol "pthread.h" "pthread_setaffinity_np" ""  "-D_GNU_SOURCE -Werror=implicit-function-declaration" && {
+        add_cflags -DAWS_AFFINITY_METHOD=AWS_AFFINITY_METHOD_PTHREAD
+        return
+    }
+
+    add_cflags -DAWS_AFFINITY_METHOD=AWS_AFFINITY_METHOD_NONE
+}
+
+check_symbol(){
+    log check_symbol "$@"
+    header="$1"
+    symbol="$2"
+    code="$3"
+    flags=''
+    shift 3
+    while [ "$1" != "" ]; do
+      append flags $1
+      shift
+    done;
+    disable $name
+    cat > $TMPC <<EOF
+    #include <$header>
+    int main(){ $code; return 0;}
+EOF
+    log_file $TMPC
+    cat "" > $TMPI
+    check_cmd $cc -E $flags -c $TMPC -o $TMPI
+    grep -q "$symbol" $TMPI
+}
+
+
+process_ldflags(){
+    if [ "$host_os" = "linux" ]|| [ "$host_os" = "apple" ]; then
+        check_symbol "pthread.h" "pthread_mutexattr_init" "" || {
+            add_ldflags -lptread
+        }
+    fi
+}
+
+### ------------------------------ gen config.h ------------------------------
+
+add_define(){
+	echo "#define $1 $2" >> ./include/aws/common/config.h
+}
+un_define(){
+	echo "// #undef $1" >> ./include/aws/common/config.h
+}
+
+process_define(){
+	if [ "$2" = "y" ]; then
+		add_define $1
+	else
+		un_define $1
+	fi
+}
+
+gen_config_h(){
+	cat > ./include/aws/common/config.h << EOF
+#ifndef AWS_COMMON_CONFIG_H
+#define AWS_COMMON_CONFIG_H
+
+EOF
+    test_code cc  "execinfo.h stdlib.h" "backtrace(NULL, 0);" && enable AWS_HAVE_EXECINFO
+
+    test_code cc "stdio.h" "typedef char array[sizeof(off_t) >= 8 ? 1 : -1];" &&  {
+        check_symbol "stdio.h" "fseeko" "" && enable AWS_HAVE_POSIX_LARGE_FILE_SUPPORT
+    }
+
+    test_code cc "linux/if_link.h" "" && enable AWS_HAVE_LINUX_IF_LINK_H
+
+    test_code cc "" "int foo = 42, bar = 24; __asm__ __volatile__(\"\":\"=r\"(foo):\"r\"(bar):\"memory\");" && enable AWS_HAVE_GCC_INLINE_ASM
+
+    test_code cc "stdbool.h" "int out,a ,b; if (__builtin_mul_overflow(a, b, &out)) { return 0; };"  && enable AWS_HAVE_GCC_OVERFLOW_MATH_EXTENSIONS
+
+	process_define AWS_HAVE_GCC_OVERFLOW_MATH_EXTENSIONS $AWS_HAVE_GCC_OVERFLOW_MATH_EXTENSIONS
+
+	process_define AWS_HAVE_GCC_INLINE_ASM $AWS_HAVE_GCC_INLINE_ASM
+
+	process_define AWS_HAVE_LINUX_IF_LINK_H $AWS_HAVE_LINUX_IF_LINK_H
+
+	process_define AWS_HAVE_POSIX_LARGE_FILE_SUPPORT $AWS_HAVE_POSIX_LARGE_FILE_SUPPORT
+
+	process_define AWS_HAVE_EXECINFO $AWS_HAVE_EXECINFO
+	process_define AWS_HAVE_WINAPI_DESKTOP $AWS_HAVE_WINAPI_DESKTOP
+
+	process_define AWS_HAVE_MSVC_INTRINSICS_X64 $AWS_HAVE_MSVC_INTRINSICS_X64
+
+	echo "#endif /* AWS_COMMON_CONFIG_H */" >> ./include/aws/common/config.h
+}
+
+add_common_srcs(){
+    append COMMON_SRCS  $(echo $@)
+}
+
+gen_srcs_set(){
+    COMMON_SRCS=
+    for file_ in ./source/*.c; do
+        add_common_srcs $file_
+    done
+
+    for file_ in ./source/external/*.c; do
+        add_common_srcs $file_
+    done
+
+    add_cflags -I./include
+    add_cflags -I./include/aws/common/external
+    add_cflags -I./include/aws/common/private
+
+    if [ "$host_os" = "apple" ] || [ "$host_os" = "linux" ] || [ "$host_os" = "freebsd" ]; then
+        add_common_srcs ./source/posix/*.c
+        add_cflags -I./include/aws/common/posix
+    fi
+}
+
+check_build_type_deps_libs(){
+    enabled static && add_ldflags "-static" || add_ldflags "-shared"
+    ## add the following lib
+    add_ldflags -lm -ldl -lpthread -lrt
+}
+
+
+
+
+###     gen config.mak
+
+gen_config_mk(){
+cat > $config_mk_file <<-EOF
+## Generated by configure. DO NOT MODIFY!
+OS=$host_os
+ARCH=$arch
+CPU=$cpu
+STATIC=$static
+SHARED=$shared
+CC=$cc
+CXX=$cxx
+LD=$(which ld)
+STRIP=$(which strip)
+RANLIB=$(which ranlib)
+NM=$(which nm)
+AS=$(which as)
+AR=$(which ar)
+ARFLAGS=$ARFLAGS
+CFLAGS=$CFLAGS
+CPPFLAGS=$CPPFLAGS
+LDFLAGS=$LDFLAGS
+STAITC_LIB_SUFFIX=$lib_static_suffix
+SHARED_LIB_SUFFIX=$lib_shared_suffix
+DEBUG=$debug
+ARCH_SRCS=$ARCH_SRCS
+AVX2_SRCS=$AVX2_SRCS
+COMMON_SRCS=$COMMON_SRCS
+CONFIG_CMD="$cmd"
+EOF
+}
+
+help(){
+cat << EOF
+Usage: $0 [options]
+Options: 
+    --cc=<compiler>         : set C compiler
+    --cxx=<compiler>        : set C++ compiler
+    --extra-cflags=<cflags> : set extra cflags
+    --release               : enable release
+    --static                : enable static only
+    --disable-cpu-extension : disable cpu extension, default is enable
+    --hide-cjson-symbol     : hide cjson symbol, default is not hide
+    -h, --help              : help messages
+EOF
+}
+
+main(){
+    init
+    process_cflags
+    process_ldflags
+    intel_avx
+    process_arch
+    process_thread_set_name
+    process_thread_get_name
+    check_pthread_affinity
+    gen_config_h
+    gen_srcs_set
+    check_build_type_deps_libs
+    gen_config_mk
+    echo ""
+    echo "Configure successfully. Go ahead to make."
+}
+
+
+
+ARGS=$(getopt -o h --long cc:,cxx:,extra-cflags:,release,static,disable-cpu-extension,hide-cjson-symbol,help -n "$0" -- "$@")
+if [ $? != 0 ]; then
+    echo "arguments error, exit" >&2
+    exit 1
+fi
+
+cmd="./configure $@"
+    
+eval set  -- "${ARGS}"
+
+while :
+do
+    case $1 in
+    --cc)
+        cc=$2; shift 2;;
+    --cxx)
+        cxx=$2; shift 2;;
+    --extra-cflags)
+        append extra_cflags "$2";
+         shift 2;;
+    --release)
+        disable debug; 
+        enable release; 
+        shift 1;;
+    --static)
+        enable static;
+        disable shared; 
+        shift 1;;
+    --disable-cpu-extension)
+        enable_cpu_ext=n; shift 1;;
+    --hide-cjson-symbol)
+        add_cflags -D_HIDE_CJSON_SYMBOL; shift 1;;
+    -h|--help)
+        help; exit 0;;
+    --)
+        shift; break;;
+    *) 
+        echo "Invalid parameters: $1" ;  exit 1 ;;
+    esac
+done
+
+main
